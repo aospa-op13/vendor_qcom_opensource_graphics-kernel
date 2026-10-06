@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2018-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/iopoll.h>
@@ -190,7 +190,7 @@ int gmu_core_timed_poll_check(struct kgsl_device *device,
 int gmu_core_map_memdesc(struct iommu_domain *domain, struct kgsl_memdesc *memdesc,
 		u64 gmuaddr, int attrs)
 {
-	size_t mapped;
+	ssize_t mapped;
 
 	if (!memdesc->pages) {
 		mapped = kgsl_mmu_map_sg(domain, gmuaddr, memdesc->sgt->sgl,
@@ -209,7 +209,10 @@ int gmu_core_map_memdesc(struct iommu_domain *domain, struct kgsl_memdesc *memde
 		sg_free_table(&sgt);
 	}
 
-	return mapped == 0 ? -ENOMEM : 0;
+	if (!mapped)
+		mapped = -ENOMEM;
+
+	return (mapped < 0) ? mapped : 0;
 }
 
 static int gmu_core_iommu_fault_handler(struct iommu_domain *domain,
@@ -290,24 +293,6 @@ int gmu_core_set_vrb_register(struct kgsl_memdesc *vrb, u32 index, u32 val)
 
 	/* Make sure the vrb write is posted before moving ahead */
 	wmb();
-
-	return 0;
-}
-
-int gmu_core_get_vrb_register(struct kgsl_memdesc *vrb, u32 index, u32 *val)
-{
-	u32 *vrb_buf;
-
-	if (IS_ERR_OR_NULL(vrb))
-		return -ENODEV;
-
-	if (WARN_ON(index >= (vrb->size >> 2))) {
-		pr_err("kgsl: Unable to get VRB register for index %u\n", index);
-		return -EINVAL;
-	}
-
-	vrb_buf = vrb->hostptr;
-	*val = vrb_buf[index];
 
 	return 0;
 }

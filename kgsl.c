@@ -37,6 +37,14 @@
 #include "kgsl_sync.h"
 #include "kgsl_sysfs.h"
 #include "kgsl_trace.h"
+
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_OSVELTE)
+#include "mm_osvelte/sys-memstat.h"
+#include "mm_osvelte/common.h"
+#endif /* CONFIG_OPLUS_FEATURE_MM_OSVELTE */
+
+
+
 /* Instantiate tracepoints */
 #define CREATE_TRACE_POINTS
 #include "kgsl_power_trace.h"
@@ -59,6 +67,9 @@
 #define KGSL_DMA_BIT_MASK	DMA_BIT_MASK(32)
 #endif
 
+#ifndef OPLUS_GPU_CONSTRAINT_LOG
+#define OPLUS_GPU_CONSTRAINT_LOG
+#endif
 /* List of dmabufs mapped */
 static LIST_HEAD(kgsl_dmabuf_list);
 static DEFINE_SPINLOCK(kgsl_dmabuf_lock);
@@ -347,6 +358,7 @@ static void kgsl_destroy_ion(struct kgsl_memdesc *memdesc)
 	}
 
 	memdesc->sgt = NULL;
+	entry->priv_data = NULL;
 }
 
 static const struct kgsl_memdesc_ops kgsl_dmabuf_ops = {
@@ -624,6 +636,100 @@ static void kgsl_context_debug_info(struct kgsl_device *device)
 }
 #endif
 
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_OSVELTE)
+
+void dump_kgsl_process_mem_detail(struct kgsl_process_private *priv);
+
+static int kgsl_procinfo_show(struct seq_file *s, void *unused)
+{
+	struct kgsl_process_private *p;
+	int type = KGSL_MEM_ENTRY_KERNEL;
+
+	seq_printf(s, "%-5s %-8s %-8s %-8s\n",
+		   "pid", "size", "mapped", "comm");
+
+	read_lock(&kgsl_driver.proclist_lock);
+	list_for_each_entry(p, &kgsl_driver.process_list, list) {
+		seq_printf(s, "%-5d %-8lld %-8lld %-16s\n", pid_nr(p->pid),
+			   atomic64_read(&p->stats[type].cur) / SZ_1K,
+			   atomic64_read(&p->gpumem_mapped) / SZ_1K, p->comm);
+	}
+	read_unlock(&kgsl_driver.proclist_lock);
+
+	seq_printf(s, "\nTotal %zu kB\n",
+		   atomic_long_read(&kgsl_driver.stats.page_alloc) / SZ_1K);
+	return 0;
+}
+DEFINE_PROC_SHOW_ATTRIBUTE(kgsl_procinfo);
+
+long read_kgsl_mem_usage(enum mtrack_subtype type)
+{
+	if (type == MTRACK_GPU_TOTAL)
+		return atomic_long_read(&kgsl_driver.stats.page_alloc) >> PAGE_SHIFT;
+
+	return 0;
+}
+
+void dump_kgsl_usage_stat(bool verbose)
+{
+    uint64_t sz = 0;
+    uint64_t max_sz = 0;
+    struct kgsl_process_private *p = NULL;
+    struct kgsl_process_private *max_sz_of_proc = NULL;
+    int type = KGSL_MEM_ENTRY_KERNEL;
+    osvelte_info("======= %s\n", __func__);
+    osvelte_info("%-16s %-5s size\n", "comm", "pid");
+    read_lock(&kgsl_driver.proclist_lock);
+    list_for_each_entry(p, &kgsl_driver.process_list, list) {
+        sz = atomic64_read(&p->stats[type].cur);
+        if (sz >= max_sz) {
+            max_sz = sz;
+            max_sz_of_proc = p;
+        }
+        osvelte_info("%-16s %-5d %lld\n", p->comm, pid_nr(p->pid), sz / SZ_1K);
+    }
+    if( kgsl_process_private_get(max_sz_of_proc) == 0){
+        read_unlock(&kgsl_driver.proclist_lock);
+        return;
+    }
+
+    read_unlock(&kgsl_driver.proclist_lock);
+    if (max_sz >= SZ_2G) {
+            osvelte_info(
+                    "%-5d is max usage and over 2G, its memtype detail is blow\n",
+                    pid_nr(max_sz_of_proc->pid));
+            dump_kgsl_process_mem_detail(max_sz_of_proc);
+    }
+    kgsl_process_private_put(max_sz_of_proc);
+}
+
+long read_pid_kgsl_mem_usage(enum mtrack_subtype mtype, pid_t pid)
+{
+	struct kgsl_process_private *p;
+	int type = KGSL_MEM_ENTRY_KERNEL;
+	unsigned long sz = 0;
+
+	if (unlikely(mtype != MTRACK_GPU_PROC_KERNEL))
+		return 0;
+
+	read_lock(&kgsl_driver.proclist_lock);
+	list_for_each_entry(p, &kgsl_driver.process_list, list) {
+		if (pid_nr(p->pid) == pid) {
+			sz = atomic64_read(&p->stats[type].cur) >> PAGE_SHIFT;
+			break;
+		}
+	}
+	read_unlock(&kgsl_driver.proclist_lock);
+	return sz;
+}
+
+static struct mtrack_debugger kgsl_mtrack_debugger = {
+	.mem_usage = read_kgsl_mem_usage,
+	.pid_mem_usage = read_pid_kgsl_mem_usage,
+	.dump_usage_stat = dump_kgsl_usage_stat,
+};
+#endif /* CONFIG_OPLUS_FEATURE_MM_OSVELTE */
+
 /**
  * kgsl_context_dump() - dump information about a draw context
  * @device: KGSL device that owns the context
@@ -861,6 +967,9 @@ kgsl_context_destroy(struct kref *kref)
 				device->pwrctrl.active_pwrlevel,
 				0);
 			device->pwrctrl.constraint.type = KGSL_CONSTRAINT_NONE;
+			#ifdef OPLUS_GPU_CONSTRAINT_LOG
+				dev_warn(kgsl_driver.devp[0]->dev,"kgsl_constraint_context_destroy ,state=0,constraint.type: %u,active_pwrlevel:%u,context->id:%u",device->pwrctrl.constraint.type,device->pwrctrl.active_pwrlevel,context->id);
+			#endif /* OPLUS_GPU_CONSTRAINT_LOG */
 		}
 
 		atomic_dec(&context->proc_priv->ctxt_count);
@@ -4736,9 +4845,9 @@ static unsigned long _gpu_set_svm_region(struct kgsl_process_private *private,
 	return addr;
 }
 
-static unsigned long get_align(struct kgsl_mem_entry *entry)
+unsigned long kgsl_get_align(struct kgsl_memdesc *memdesc)
 {
-	int bit = kgsl_memdesc_get_align(&entry->memdesc);
+	u32 bit = kgsl_memdesc_get_align(memdesc);
 
 	if (bit >= ilog2(SZ_2M))
 		return SZ_2M;
@@ -4747,7 +4856,7 @@ static unsigned long get_align(struct kgsl_mem_entry *entry)
 	else if (bit >= ilog2(SZ_64K))
 		return SZ_64K;
 
-	return SZ_4K;
+	return PAGE_SIZE;
 }
 
 static unsigned long set_svm_area(struct file *file,
@@ -4780,7 +4889,7 @@ static unsigned long get_svm_unmapped_area(struct file *file,
 {
 	struct kgsl_device_private *dev_priv = file->private_data;
 	struct kgsl_process_private *private = dev_priv->process_priv;
-	unsigned long align = get_align(entry);
+	unsigned long align = kgsl_get_align(&entry->memdesc);
 	unsigned long ret, iova;
 	u64 start = 0, end = 0;
 	struct vm_area_struct *vma;
@@ -5126,6 +5235,14 @@ static int _register_device(struct kgsl_device *device)
 
 	device->dev->dma_mask = &dma_mask;
 	device->dev->dma_parms = &dma_parms;
+	/*
+	 * Mark KGSL device as dma coherent when io-coherency
+	 * is enabled to skip cache operations for imported dma
+	 * buffers.
+	 */
+	if (kgsl_mmu_has_feature(device, KGSL_MMU_IO_COHERENT) &&
+		IS_ENABLED(CONFIG_QCOM_KGSL_IOCOHERENCY_DEFAULT))
+		device->dev->dma_coherent = true;
 
 	dma_set_max_seg_size(device->dev, (u32)DMA_BIT_MASK(32));
 
@@ -5330,6 +5447,11 @@ void kgsl_core_exit(void)
 		ARRAY_SIZE(kgsl_driver.devp));
 
 	sysstats_unregister_kgsl_stats_cb();
+
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_OSVELTE)
+	unregister_mtrack_debugger(MTRACK_GPU, &kgsl_mtrack_debugger);
+	unregister_mtrack_procfs(MTRACK_GPU, "procinfo");
+#endif /* CONFIG_OPLUS_FEATURE_MM_OSVELTE */
 }
 
 int __init kgsl_core_init(void)
@@ -5445,6 +5567,11 @@ int __init kgsl_core_init(void)
 	sysstats_register_kgsl_stats_cb(kgsl_get_stats);
 
 	KGSL_BOOT_MARKER("KGSL Ready");
+
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_OSVELTE)
+	register_mtrack_debugger(MTRACK_GPU, &kgsl_mtrack_debugger);
+	register_mtrack_procfs(MTRACK_GPU, "procinfo", 0444, &kgsl_procinfo_proc_ops, NULL);
+#endif /* CONFIG_OPLUS_FEATURE_MM_OSVELTE */
 
 	return 0;
 

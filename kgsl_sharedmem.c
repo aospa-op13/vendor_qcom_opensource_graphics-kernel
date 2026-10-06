@@ -18,6 +18,10 @@
 #include "kgsl_reclaim.h"
 #include "kgsl_sharedmem.h"
 
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_OSVELTE)
+#include "mm_osvelte/common.h"
+#endif /* CONFIG_OPLUS_FEATURE_MM_OSVELTE */
+
 /*
  * The user can set this from debugfs to force failed memory allocations to
  * fail without trying OOM first.  This is a debug setting useful for
@@ -823,7 +827,6 @@ void kgsl_memdesc_init(struct kgsl_device *device,
 		memdesc->priv |= KGSL_MEMDESC_SECURE;
 
 	memdesc->flags = flags;
-	memdesc->kgsl_dev = device->dev;
 
 	/*
 	 * For io-coherent buffers don't set memdesc->dev, so that we skip DMA
@@ -1138,7 +1141,7 @@ static int kgsl_alloc_page(struct kgsl_memdesc *memdesc, int *page_size,
 	    (list_empty(&memdesc->shmem_page_list) && (pcount > 1)))
 		clear_highpage(page);
 
-	kgsl_page_sync(memdesc->kgsl_dev, page, PAGE_SIZE, DMA_TO_DEVICE);
+	kgsl_page_sync(memdesc->dev, page, PAGE_SIZE, DMA_TO_DEVICE);
 
 	*page_size = PAGE_SIZE;
 	*pages = page;
@@ -1187,19 +1190,24 @@ static void _kgsl_free_pages(struct kgsl_memdesc *memdesc)
 	WARN(!list_empty(&memdesc->shmem_page_list),
 	     "KGSL shmem page list is not empty\n");
 
-	for (i = 0; i < memdesc->page_count; i++)
-		if (memdesc->pages[i])
-			put_page(memdesc->pages[i]);
+	for (i = 0; i < memdesc->page_count;) {
+		int n;
+
+		if (!memdesc->pages[i]) {
+			i++;
+			continue;
+		}
+
+		n = 1 << compound_order(memdesc->pages[i]);
+		put_page(memdesc->pages[i]);
+
+		i += n;
+	}
 
 	SHMEM_I(memdesc->shmem_filp->f_mapping->host)->android_vendor_data1 = 0;
 	fput(memdesc->shmem_filp);
 }
 
-/* If CONFIG_QCOM_KGSL_USE_SHMEM is defined we don't use compound pages */
-static u32 kgsl_get_page_order(struct page *page)
-{
-	return 0;
-}
 #else
 void kgsl_register_shmem_callback(void) { }
 
@@ -1211,7 +1219,7 @@ static int kgsl_alloc_page(struct kgsl_memdesc *memdesc, int *page_size,
 		return -EINTR;
 
 	return kgsl_pool_alloc_page(page_size, pages,
-			pages_len, align, memdesc->kgsl_dev);
+			pages_len, align, memdesc->dev);
 }
 
 static int kgsl_memdesc_file_setup(struct kgsl_memdesc *memdesc)
@@ -1233,10 +1241,6 @@ static void _kgsl_free_pages(struct kgsl_memdesc *memdesc)
 	kgsl_pool_free_pages(memdesc->pages, memdesc->page_count);
 }
 
-static u32 kgsl_get_page_order(struct page *page)
-{
-	return compound_order(page);
-}
 #endif
 
 void kgsl_page_sync(struct device *dev, struct page *page,
@@ -1340,7 +1344,7 @@ static int _kgsl_alloc_pages(struct kgsl_memdesc *memdesc,
 			}
 
 			for (i = 0; i < count; ) {
-				int n = 1 << kgsl_get_page_order(local[i]);
+				int n = 1 << compound_order(local[i]);
 
 				kgsl_free_page(local[i]);
 				i += n;
@@ -1653,7 +1657,7 @@ static int kgsl_system_alloc_pages(struct kgsl_memdesc *memdesc, struct page ***
 		}
 
 		/* Make sure the cache is clean */
-		kgsl_page_sync(memdesc->kgsl_dev, local[i], PAGE_SIZE, DMA_TO_DEVICE);
+		kgsl_page_sync(memdesc->dev, local[i], PAGE_SIZE, DMA_TO_DEVICE);
 	}
 
 	*pages = local;
@@ -1988,3 +1992,36 @@ void kgsl_free_globals(struct kgsl_device *device)
 		kfree(md);
 	}
 }
+
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_OSVELTE)
+void dump_kgsl_process_mem_detail(struct kgsl_process_private *priv)
+{
+    int i = 0;
+    int id = 0;
+    struct kgsl_mem_entry *entry = NULL;
+    uint64_t *memtype_detail = (uint64_t *)kmalloc((KGSL_MEMTYPE_KERNEL + 1) * sizeof(uint64_t), GFP_KERNEL);
+    spin_lock(&priv->mem_lock);
+    for (entry = idr_get_next(&priv->mem_idr, &id); entry;
+        id++, entry = idr_get_next(&priv->mem_idr, &id)) {
+        struct kgsl_memdesc *memdesc;
+        unsigned int type;
+        if (!kgsl_mem_entry_get(entry))
+            continue;
+        spin_unlock(&priv->mem_lock);
+        memdesc = &entry->memdesc;
+        type = kgsl_memdesc_get_memtype(memdesc);
+        if (type <= KGSL_MEMTYPE_KERNEL)
+            memtype_detail[type] += memdesc->size;
+        kgsl_mem_entry_put(entry);
+        spin_lock(&priv->mem_lock);
+    }
+    spin_unlock(&priv->mem_lock);
+    osvelte_info("%-16s %-5s \n", "memtype", "size");
+    for (i = 0; i <= KGSL_MEMTYPE_KERNEL; i++) {
+        if (memtype_detail[i] > 0) {
+            osvelte_info("%-16d %-5llu\n", i, memtype_detail[i] / SZ_1K);
+        }
+    }
+    kfree(memtype_detail);
+}
+#endif /* CONFIG_OPLUS_FEATURE_MM_OSVELTE */

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2010-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/clk/qcom.h>
@@ -19,10 +19,20 @@
 
 #include "kgsl_device.h"
 #include "kgsl_bus.h"
+#include "kgsl_eventlog.h"
+#include "kgsl_power_trace.h"
 #include "kgsl_pwrscale.h"
 #include "kgsl_sysfs.h"
 #include "kgsl_trace.h"
 #include "kgsl_util.h"
+
+#ifndef OPLUS_GPU_CONSTRAINT_LOG
+#define OPLUS_GPU_CONSTRAINT_LOG
+#endif
+
+#ifndef OPLUS_GPU_OLD_CHIPS
+#define OPLUS_GPU_OLD_CHIPS
+#endif
 
 #define UPDATE_BUSY_VAL		1000000
 
@@ -76,6 +86,12 @@ static void _bimc_clk_prepare_enable(struct kgsl_device *device,
  */
 static u32 _adjust_pwrlevel(struct kgsl_pwrctrl *pwr, u32 level, struct kgsl_pwr_constraint *pwrc)
 {
+	#ifdef OPLUS_GPU_CONSTRAINT_LOG
+	if(pwr->thermal_pwrlevel > pwr->pmqos_max_pwrlevel)
+	{
+		dev_warn(kgsl_driver.devp[0]->dev,"kgsl_thermal_pwrlevel %u > pwr->pmqos_max_pwrlevel %u",pwr->thermal_pwrlevel,pwr->pmqos_max_pwrlevel);
+	}
+	#endif /* OPLUS_GPU_CONSTRAINT_LOG */
 	u32 thermal_pwrlevel = max_t(u32, READ_ONCE(pwr->thermal_pwrlevel),
 			READ_ONCE(pwr->pmqos_max_pwrlevel));
 	/* Ensure that max pwrlevel is within pmqos max limit */
@@ -178,6 +194,9 @@ done:
 		/* Trace the constraint being un-set by the driver */
 		trace_kgsl_constraint(device, pwr->constraint.type,
 						old_level, 0);
+		#ifdef OPLUS_GPU_CONSTRAINT_LOG
+			dev_warn(device->dev,"kgsl_constraint_reset ,func: %s,state=0,pwr->constraint.type: %u,old_level:%u,ctx->id: %u",__func__,pwr->constraint.type,old_level,pwr->constraint.owner_id);
+		#endif /* OPLUS_GPU_CONSTRAINT_LOG */
 		/*Invalidate the constraint set */
 		pwr->constraint.expires = 0;
 		pwr->constraint.type = KGSL_CONSTRAINT_NONE;
@@ -249,7 +268,7 @@ void kgsl_pwrctrl_pwrlevel_change(struct kgsl_device *device,
 			pwr->previous_pwrlevel,
 			pwr->pwrlevels[old_level].gpu_freq);
 
-	trace_gpu_frequency(pwrlevel->gpu_freq/1000, 0);
+	KGSL_TRACE_GPU_FREQ(pwrlevel->gpu_freq/1000, 0);
 
 	/*  Update the bus after GPU clock decreases. */
 	if (new_level > old_level)
@@ -312,6 +331,13 @@ void kgsl_pwrctrl_set_constraint(struct kgsl_device *device,
 		kgsl_pwrctrl_pwrlevel_change(device, constraint);
 		/* Trace the constraint being set by the driver */
 		trace_kgsl_constraint(device, pwrc_old->type, constraint, 1);
+
+#ifdef OPLUS_GPU_CONSTRAINT_LOG
+		/* Only print when constraint is lower than highest freq */
+		if (constraint != 0) {
+			dev_warn(device->dev, "kgsl_constraint:constraint_value=%u status=1,context->id:%u,pwrc->type:%u,pwrc->sub_type:%u", constraint,id,pwrc->type,pwrc->sub_type);
+		}
+#endif /* OPLUS_GPU_CONSTRAINT_LOG */
 	} else if ((pwrc_old->type == pwrc->type) && (pwrc_old->sub_type == pwrc->sub_type)) {
 		pwrc_old->owner_id = id;
 		pwrc_old->owner_timestamp = ts;
@@ -476,7 +502,17 @@ static ssize_t num_pwrlevels_show(struct device *dev,
 static int _get_nearest_pwrlevel(struct kgsl_pwrctrl *pwr, unsigned int clock)
 {
 	int i;
-
+	#ifdef OPLUS_GPU_OLD_CHIPS
+	if (clock > pwr->pwrlevels[0].gpu_freq){
+		if(kgsl_driver.devp[0]->dev != NULL){
+			dev_err(kgsl_driver.devp[0]->dev, "kgsl_clock %u> pwr->pwrlevels[0].gpu_freq  %u, \n",clock, pwr->pwrlevels[0].gpu_freq);
+		}
+		clock = pwr->pwrlevels[0].gpu_freq;
+	}
+	if (clock < pwr->pwrlevels[pwr->num_pwrlevels - 1].gpu_freq){
+		clock = pwr->pwrlevels[pwr->num_pwrlevels - 1].gpu_freq;
+	}
+	#endif /* OPLUS_GPU_OLD_CHIPS */
 	for (i = pwr->num_pwrlevels - 1; i >= 0; i--) {
 		if (abs(pwr->pwrlevels[i].gpu_freq - clock) < 5000000)
 			return i;
@@ -1366,16 +1402,27 @@ int kgsl_pwrctrl_enable_cx_gdsc(struct kgsl_device *device)
 	if (!pwr->cx_regulator && !pwr->gmu_cx_pd)
 		return 0;
 
-	ret = wait_for_completion_timeout(&pwr->cx_gdsc_gate, msecs_to_jiffies(5000));
-	if (!ret) {
-		/* Dump the cx regulator consumer list */
-		if (pwr->cx_regulator) {
-			dev_err(device->dev, "GPU CX wait timeout. Dumping CX votes:\n");
-			qcom_clk_dump(NULL, pwr->cx_regulator, false);
-		} else {
-			dev_err(device->dev, "GPU CX wait timeout\n");
+	/*
+	 * Wait for CX GDSC collapse during hang recovery to prevent
+	 * boot up from stale state.
+	 */
+	if (device->ftbl->is_reset_recovery(device)) {
+		ret = wait_for_completion_timeout(&pwr->cx_gdsc_gate, msecs_to_jiffies(5000));
+		if (!ret) {
+			/* Dump the cx regulator consumer list */
+			if (pwr->cx_regulator) {
+				dev_err(device->dev, "GPU CX wait timeout. Dumping CX votes:\n");
+				qcom_clk_dump(NULL, pwr->cx_regulator, false);
+			} else {
+				dev_err(device->dev, "GPU CX wait timeout\n");
+			}
+			KGSL_GMU_CORE_FORCE_PANIC(device->gmu_core.gf_panic,
+				GMU_PDEV(device), 0ULL, GMU_FAULT_CX_WAIT_TIMEOUT);
 		}
 	}
+
+	if (!completion_done(&pwr->cx_gdsc_gate))
+		log_kgsl_cx_wait_timeout_event(HLOS_CX_WAIT_TIMEOUT);
 
 	if (pwr->cx_regulator)
 		ret = regulator_enable(pwr->cx_regulator);
@@ -1558,6 +1605,11 @@ int kgsl_pwrctrl_probe_gdscs(struct kgsl_device *device, struct platform_device 
 	pwr->gmu_cx_pd = NULL;
 	pwr->cx_pd = NULL;
 
+	if (pwr->cx_pd)
+		dev_pm_domain_detach(pwr->cx_pd, false);
+	
+	pwr->gmu_cx_pd = NULL;
+	pwr->cx_pd = NULL;
 	return ret;
 }
 
@@ -1579,8 +1631,12 @@ static int kgsl_cx_gdsc_event(struct notifier_block *nb,
 
 	if (pwr->cx_cfg_gdsc_offset) {
 		if (kgsl_regmap_read_poll_timeout(&device->regmap, pwr->cx_cfg_gdsc_offset,
-			val, (val & BIT(15)), 100, 100 * 1000))
-			dev_err(device->dev, "GPU CX wait timeout.\n");
+			val, (val & BIT(15)), 100, 100 * 1000)) {
+			dev_err(device->dev, "GPU CX GDSC power down timed out\n");
+			log_kgsl_cx_wait_timeout_event(NONHLOS_CX_WAIT_TIMEOUT);
+			KGSL_GMU_CORE_FORCE_PANIC(device->gmu_core.gf_panic,
+				GMU_PDEV(device), 0ULL, GMU_FAULT_WAIT_FOR_CX);
+		}
 	}
 
 	pwr->cx_gdsc_wait = false;
@@ -1784,7 +1840,15 @@ static int pmqos_max_notifier_call(struct notifier_block *nb, unsigned long val,
 
 	if (!device->pwrscale.devfreq_enabled)
 		return NOTIFY_DONE;
-
+	#ifdef OPLUS_GPU_OLD_CHIPS
+	if (max_freq > pwr->pwrlevels[0].gpu_freq){
+		dev_err(device->dev, "kgsl_max_freq %u> pwr->pwrlevels[0].gpu_freq  %u\n",max_freq, pwr->pwrlevels[0].gpu_freq);
+		max_freq = pwr->pwrlevels[0].gpu_freq;
+	}
+	if (max_freq < pwr->pwrlevels[pwr->num_pwrlevels - 1].gpu_freq){
+		max_freq = pwr->pwrlevels[pwr->num_pwrlevels - 1].gpu_freq;
+	}
+	#endif /*OPLUS_GPU_OLD_CHIPS*/
 	for (level = pwr->num_pwrlevels - 1; level >= 0; level--) {
 		/* get nearest power level with a maximum delta of 5MHz */
 		if (abs(pwr->pwrlevels[level].gpu_freq - max_freq) < 5000000)
@@ -1800,6 +1864,12 @@ static int pmqos_max_notifier_call(struct notifier_block *nb, unsigned long val,
 	pwr->pmqos_max_pwrlevel = level;
 
 	trace_kgsl_thermal_constraint(max_freq);
+#ifdef OPLUS_GPU_CONSTRAINT_LOG
+	/* Only print when constraint is lower than highest freq */
+	if (max_freq < pwr->pwrlevels[0].gpu_freq) {
+		dev_warn(kgsl_driver.devp[0]->dev,"kgsl_thermal_constraint:max_freq=%u, function: %s,val: %lu", max_freq, __func__,val);
+	}
+#endif /* OPLUS_GPU_CONSTRAINT_LOG */
 
 	mutex_lock(&device->mutex);
 
@@ -1844,6 +1914,13 @@ static int kgsl_cooling_set_cur_state(struct thermal_cooling_device *cooling_dev
 
 	freq = pwr->pwrlevels[state].gpu_freq;
 	trace_kgsl_thermal_constraint(freq);
+#ifdef OPLUS_GPU_CONSTRAINT_LOG
+	/* Only print when constraint is lower than highest freq */
+	if (state > 0) {
+		dev_warn(kgsl_driver.devp[0]->dev,"kgsl_thermal_constraint:cur_freq=%u,state :%lu", freq,state);
+	}
+#endif /* OPLUS_GPU_CONSTRAINT_LOG */
+
 	WRITE_ONCE(pwr->thermal_pwrlevel, state);
 
 	mutex_lock(&device->mutex);
@@ -2256,7 +2333,7 @@ static int _wake(struct kgsl_device *device)
 		kgsl_pwrctrl_axi(device, true);
 		kgsl_pwrscale_wake(device);
 		kgsl_pwrctrl_irq(device, true);
-		trace_gpu_frequency(
+		KGSL_TRACE_GPU_FREQ(
 			pwr->pwrlevels[pwr->active_pwrlevel].gpu_freq/1000, 0);
 
 		kgsl_bus_update(device, KGSL_BUS_VOTE_ON);
@@ -2347,7 +2424,7 @@ _slumber(struct kgsl_device *device)
 		device->ftbl->stop(device);
 		kgsl_pwrctrl_disable(device);
 		kgsl_pwrscale_sleep(device);
-		trace_gpu_frequency(0, 0);
+		KGSL_TRACE_GPU_FREQ(0, 0);
 		kgsl_pwrctrl_set_state(device, KGSL_STATE_SLUMBER);
 		break;
 	case KGSL_STATE_SUSPEND:
@@ -2357,7 +2434,7 @@ _slumber(struct kgsl_device *device)
 		break;
 	case KGSL_STATE_AWARE:
 		kgsl_pwrctrl_disable(device);
-		trace_gpu_frequency(0, 0);
+		KGSL_TRACE_GPU_FREQ(0, 0);
 		kgsl_pwrctrl_set_state(device, KGSL_STATE_SLUMBER);
 		break;
 	default:
@@ -2537,8 +2614,13 @@ int kgsl_active_count_wait(struct kgsl_device *device, int count,
 static int kgsl_pwrctrl_set_default_gpu_pwrlevel(struct kgsl_device *device)
 {
 	struct kgsl_pwrctrl *pwr = &device->pwrctrl;
-	unsigned int new_level = pwr->default_pwrlevel;
-	unsigned int old_level = pwr->active_pwrlevel;
+	unsigned int new_level = (pwr->active_pwrlevel + pwr->default_pwrlevel)/2;
+	unsigned int old_level = pwr->previous_pwrlevel;
+
+	if (new_level > pwr->default_pwrlevel) {
+		new_level = pwr->default_pwrlevel;
+		old_level = pwr->active_pwrlevel;
+	}
 
 	/*
 	 * Update the level according to any thermal,

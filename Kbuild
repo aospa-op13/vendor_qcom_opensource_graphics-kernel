@@ -74,7 +74,7 @@ ifeq ($(CONFIG_ARCH_SCUBA), y)
 	include $(KGSL_PATH)/config/gki_scuba.conf
 endif
 
-ccflags-y += -I$(KGSL_PATH) -I$(KGSL_PATH)/include/linux -I$(KGSL_PATH)/include -I$(KERNEL_SRC)/drivers/devfreq
+ccflags-y += -I$(KGSL_PATH) -I$(KGSL_PATH)/include/linux -I$(KGSL_PATH)/include -I$(KERNEL_SRC)/drivers/devfreq -I$(KERNEL_SRC)/mm/oplus_mm
 
 obj-$(CONFIG_QCOM_KGSL) += msm_kgsl.o
 
